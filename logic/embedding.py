@@ -8,6 +8,7 @@ import matplotlib.cm as cm
 from gensim.models import Word2Vec
 from nltk.corpus import cess_esp
 from nltk.corpus import brown
+from datasets import load_dataset
 from tqdm import tqdm
 import operator
 from logic.text_analysis import TextAnalysis
@@ -26,52 +27,88 @@ class Embedding(object):
         self.text_analysis = TextAnalysis(lang)
         self.corpus = self.import_words_corpus()
 
-    def import_words_corpus(self):
+    def import_words_corpus(self, max_samples=100000):
         """
-        :Version: 1.0
+        :Version: 1.1
         :Author: Edwin Puertas
-        This function  import corpus in spanish and english from SemEval-2018 AIT DISC.
-        :param lang: language
-        :type lang: Text
-        :rtype: Object
-        :return: Object embedding
+        This function imports corpus in spanish, english, or french.
+        Uses SemEval-2018 for es/en and Wikipedia via HuggingFace for other languages.
+        :param max_samples: max Wikipedia articles to load (for languages without SemEval data)
+        :type max_samples: int
+        :rtype: list
+        :return: list of text strings
         """
         result = []
         try:
-            file_es = 'SemEval-2018_AIT_DISC_ES.csv'
-            file_en = 'SemEval-2018_AIT_DISC_EN.csv'
-            print('Loading.... {0} corpus'.format(file_es if self.lang == 'es' else file_en))
-            if self.lang == 'es':
-                corpus = self.text_analysis.import_corpus(file=file_es)
+            if self.lang in ('es', 'en'):
+                file_es = 'SemEval-2018_AIT_DISC_ES.csv'
+                file_en = 'SemEval-2018_AIT_DISC_EN.csv'
+                file = file_es if self.lang == 'es' else file_en
+                print('Loading.... {0} corpus'.format(file))
+                corpus = self.text_analysis.import_corpus(file=file)
+                result = [i[1] for i in corpus]
             else:
-                corpus = self.text_analysis.import_corpus(file=file_en)
-            result = [i[1] for i in corpus]
+                print('Loading.... Wikipedia {0} corpus from HuggingFace'.format(self.lang))
+                config_name = '20231101.{0}'.format(self.lang)
+                dataset = load_dataset('wikimedia/wikipedia', config_name, split='train')
+                articles = dataset['text'][:max_samples]
+                for article in tqdm(articles):
+                    import re
+                    clean = re.sub(r'\s+', ' ', article).strip()
+                    if len(clean) > 50:
+                        result.append(clean)
+                print('Loaded {0} texts from Wikipedia'.format(len(result)))
         except Exception as e:
             Utils.standard_error(sys.exc_info())
             print('Error import_words_corpus: {0}'.format(e))
         return result
 
-    def import_part_corpus(self, lang='es'):
+    def import_part_corpus(self, lang='es', max_samples=100000):
         """
-        :Version: 1.0
+        :Version: 1.1
         :Author: Edwin Puertas
-        This function  import corpus in spanish and english from NTLK.
-        :param lang: language
+        This function imports corpus in spanish, english, or french.
+        Uses NLTK corpora for es/en and Wikipedia via HuggingFace for fr.
+        :param lang: language code ('es', 'en', 'fr')
         :type lang: Text
-        :rtype: Object
-        :return: Object embedding
+        :param max_samples: max Wikipedia articles to load (for fr)
+        :type max_samples: int
+        :rtype: list
+        :return: list of text strings
         """
         result = []
         try:
-            print('Loading.... {0} corpus'.format('CESS' if self.lang == 'es' else 'BROWN'))
-            sentences_list = cess_esp.sents() if lang == 'es' else brown.sents(categories=['editorial'])
-            for sent in tqdm(list(sentences_list)):
-                list_text = [str(token).lower() for token in list(sent)]
-                text = ' '.join(list_text)
-                result.append(text)
+            if lang == 'es':
+                print('Loading.... CESS corpus')
+                sentences_list = cess_esp.sents()
+                for sent in tqdm(list(sentences_list)):
+                    list_text = [str(token).lower() for token in list(sent)]
+                    text = ' '.join(list_text)
+                    result.append(text)
+            elif lang == 'en':
+                print('Loading.... BROWN corpus')
+                sentences_list = brown.sents(categories=['editorial'])
+                for sent in tqdm(list(sentences_list)):
+                    list_text = [str(token).lower() for token in list(sent)]
+                    text = ' '.join(list_text)
+                    result.append(text)
+            else:
+                print('Loading.... Wikipedia {0} corpus from HuggingFace'.format(lang))
+                config_name = '20231101.{0}'.format(lang)
+                dataset = load_dataset('wikimedia/wikipedia', config_name, split='train')
+                articles = dataset['text'][:max_samples]
+                for article in tqdm(articles):
+                    import re
+                    clean = re.sub(r'\s+', ' ', article).strip().lower()
+                    sentences = re.split(r'[.!?\n]+', clean)
+                    for sent in sentences:
+                        sent = sent.strip()
+                        if len(sent.split()) > 3:
+                            result.append(sent)
+                print('Loaded {0} sentences from Wikipedia'.format(len(result)))
         except Exception as e:
             Utils.standard_error(sys.exc_info())
-            print('Error import_phonemes_corpus: {0}'.format(e))
+            print('Error import_part_corpus: {0}'.format(e))
         return result
 
     def words_embedding(self, model_name='word_embedding', size=300, min_count=50, window=5, sample=6e-5, negative=20,

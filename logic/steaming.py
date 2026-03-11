@@ -6,7 +6,7 @@ class Steaming(object):
     name = 'stemmer'
 
     def __init__(self, lang):
-        dict_lang = {'es': 'spanish', 'en': 'english'}
+        dict_lang = {'es': 'spanish', 'en': 'english', 'fr': 'french'}
         self.stemmer = SnowballStemmer(dict_lang[lang])
         Token.set_extension('stem', default='', force=True)
 

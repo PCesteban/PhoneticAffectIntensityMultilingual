@@ -5,6 +5,7 @@ import unicodedata
 import spacy
 from spacy.lang.es import Spanish
 from spacy.lang.en import English
+from spacy.lang.fr import French
 from nltk import SnowballStemmer
 from spacymoji import Emoji
 from spacy_syllables import SpacySyllables
@@ -22,8 +23,8 @@ class TextAnalysis(object):
     lang = 'es'
 
     def __init__(self, lang):
-        lang_ipa = {'es': 'spa-Latn', 'en': 'eng-Latn'}
-        lang_stemm = {'es': 'spanish', 'en': 'english'}
+        lang_ipa = {'es': 'spa-Latn', 'en': 'eng-Latn', 'fr': 'fra-Latn'}
+        lang_stemm = {'es': 'spanish', 'en': 'english', 'fr': 'french'}
         self.lang = lang
         self.stemmer = SnowballStemmer(language=lang_stemm[lang])
         self.epi = epitran.Epitran(lang_ipa[lang])
@@ -32,10 +33,12 @@ class TextAnalysis(object):
     def load_sapcy(self, lang):
         result = None
         try:
-            if lang == 'es':
-                result = spacy.load('es_core_news_md', disable=['ner'])
-            else:
-                result = spacy.load('en_core_web_md', disable=['ner'])
+            spacy_models = {
+                'es': 'es_core_news_md',
+                'en': 'en_core_web_md',
+                'fr': 'fr_core_news_md',
+            }
+            result = spacy.load(spacy_models[lang], disable=['ner'])
             stemmer_text = Steaming(lang)  # initialise component
             syllables = SpacySyllables(result)
             emoji = Emoji(result)
@@ -87,17 +90,17 @@ class TextAnalysis(object):
                             list_syllable = [token['syllables'] for token in self.tagger(stm) if
                                              token['syllables'] is not None]
                             list_syllable_phonetic = []
-                            for syllable in list_syllable:
-                                n = len(syllable) if size_syllable == 0 else size_syllable
-                                for s in list_syllable[:n]:
+                            for token_syllables in list_syllable:
+                                n = len(token_syllables) if size_syllable == 0 else size_syllable
+                                for s in token_syllables[:n]:
                                     syllable_phonetic = self.epi.transliterate(s, normpunc=True)
-                                    if syllable_phonetic is not [' ', '', '\ufeff', '1']:
+                                    if syllable_phonetic not in [' ', '', '\ufeff', '1']:
                                         list_syllable_phonetic.append(syllable_phonetic)
                             result.append(list_syllable_phonetic)
                             print('vector: {0}'.format(list_syllable_phonetic))
                         else:
                             list_phonemes = self.epi.trans_list(stm, normpunc=True)
-                            list_phonemes = [i for i in list_phonemes if i is not [' ', '', '\ufeff', '1']]
+                            list_phonemes = [i for i in list_phonemes if i not in [' ', '', '\ufeff', '1']]
                             result.append(list_phonemes)
                             print('Vector: {0}'.format(list_phonemes))
         except Exception as e:
@@ -266,7 +269,8 @@ class TextAnalysis(object):
     def stopwords(text):
         result = ''
         try:
-            nlp = Spanish()if TextAnalysis.lang == 'es' else English()
+            lang_nlp = {'es': Spanish, 'en': English, 'fr': French}
+            nlp = lang_nlp.get(TextAnalysis.lang, English)()
             doc = nlp(text)
             token_list = [token.text for token in doc]
             sentence = []
