@@ -2,9 +2,11 @@ import multiprocessing
 import os
 import sys
 import time
+import traceback
 import numpy as np
 import pandas as pd
 import matplotlib.cm as cm
+import spacy
 from gensim.models import Word2Vec
 from nltk.corpus import cess_esp
 from nltk.corpus import brown
@@ -17,15 +19,22 @@ from root import DIR_IMAGE, DIR_MODELS, DIR_EMBEDDING
 from sklearn.manifold import TSNE
 import matplotlib.pyplot as plt
 
+# datasets uses spacy.Language in its dill helpers; spaCy 2 exposes it under spacy.language.Language.
+if not hasattr(spacy, "Language"):
+    from spacy.language import Language as _SpacyLanguage
+
+    spacy.Language = _SpacyLanguage
+
 
 class Embedding(object):
 
-    def __init__(self, lang='es'):
+    def __init__(self, lang='es', max_samples=100000):
         self.lang = lang
+        self.max_samples = max_samples
         self.cores = multiprocessing.cpu_count()
-        self.part_corpus = self.import_part_corpus(lang)
+        self.part_corpus = self.import_part_corpus(lang=lang, max_samples=max_samples)
         self.text_analysis = TextAnalysis(lang)
-        self.corpus = self.import_words_corpus()
+        self.corpus = self.import_words_corpus(max_samples=max_samples)
 
     def import_words_corpus(self, max_samples=100000):
         """
@@ -49,11 +58,13 @@ class Embedding(object):
                 result = [i[1] for i in corpus]
             else:
                 print('Loading.... Wikipedia {0} corpus from HuggingFace'.format(self.lang))
+                print('Wikipedia sample cap: {0}'.format(max_samples))
                 config_name = '20231101.{0}'.format(self.lang)
                 dataset = load_dataset('wikimedia/wikipedia', config_name, split='train')
-                articles = dataset['text'][:max_samples]
-                for article in tqdm(articles):
+                rows = dataset if max_samples is None else dataset.select(range(min(max_samples, len(dataset))))
+                for row in tqdm(rows):
                     import re
+                    article = row.get('text', '')
                     clean = re.sub(r'\s+', ' ', article).strip()
                     if len(clean) > 50:
                         result.append(clean)
@@ -61,6 +72,7 @@ class Embedding(object):
         except Exception as e:
             Utils.standard_error(sys.exc_info())
             print('Error import_words_corpus: {0}'.format(e))
+            traceback.print_exc()
         return result
 
     def import_part_corpus(self, lang='es', max_samples=100000):
@@ -94,11 +106,13 @@ class Embedding(object):
                     result.append(text)
             else:
                 print('Loading.... Wikipedia {0} corpus from HuggingFace'.format(lang))
+                print('Wikipedia sample cap: {0}'.format(max_samples))
                 config_name = '20231101.{0}'.format(lang)
                 dataset = load_dataset('wikimedia/wikipedia', config_name, split='train')
-                articles = dataset['text'][:max_samples]
-                for article in tqdm(articles):
+                rows = dataset if max_samples is None else dataset.select(range(min(max_samples, len(dataset))))
+                for row in tqdm(rows):
                     import re
+                    article = row.get('text', '')
                     clean = re.sub(r'\s+', ' ', article).strip().lower()
                     sentences = re.split(r'[.!?\n]+', clean)
                     for sent in sentences:
@@ -109,11 +123,16 @@ class Embedding(object):
         except Exception as e:
             Utils.standard_error(sys.exc_info())
             print('Error import_part_corpus: {0}'.format(e))
+            traceback.print_exc()
         return result
 
     def words_embedding(self, model_name='word_embedding', size=300, min_count=50, window=5, sample=6e-5, negative=20,
                         alpha=0.03, min_alpha=0.0007):
         try:
+            if self.lang == 'fr' and size != 150:
+                print('Forcing French word embedding size to 150 for PETER compatibility')
+                size = 150
+
             start_time = time.time()
             corpus_vec = self.text_analysis.sentences_vector(self.corpus)
 

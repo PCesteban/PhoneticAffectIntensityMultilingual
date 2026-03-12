@@ -7,8 +7,15 @@ from spacy.lang.es import Spanish
 from spacy.lang.en import English
 from spacy.lang.fr import French
 from nltk import SnowballStemmer
-from spacymoji import Emoji
-from spacy_syllables import SpacySyllables
+try:
+    from spacymoji import Emoji
+except Exception:
+    Emoji = None
+
+try:
+    from spacy_syllables import SpacySyllables
+except Exception:
+    SpacySyllables = None
 import pandas as pd
 import epitran
 from tqdm import tqdm
@@ -40,10 +47,21 @@ class TextAnalysis(object):
             }
             result = spacy.load(spacy_models[lang], disable=['ner'])
             stemmer_text = Steaming(lang)  # initialise component
-            syllables = SpacySyllables(result)
-            emoji = Emoji(result)
-            result.add_pipe(syllables, after="tagger")
-            result.add_pipe(emoji, first=True)
+
+            if SpacySyllables is not None:
+                try:
+                    syllables = SpacySyllables(result)
+                    result.add_pipe(syllables, after="tagger")
+                except Exception as e:
+                    print('Warning: syllables component disabled: {0}'.format(e))
+
+            if Emoji is not None:
+                try:
+                    emoji = Emoji(result)
+                    result.add_pipe(emoji, first=True)
+                except Exception as e:
+                    print('Warning: emoji component disabled: {0}'.format(e))
+
             result.add_pipe(stemmer_text, after='parser', name='stemmer')
             print('Language: {0}\nText Analysis: {1}'.format(lang, result.pipe_names))
         except Exception as e:
