@@ -23,6 +23,19 @@ python run\generate_syllable_embedding_fr.py
 python run\generate_phoneme_embedding_fr.py
 ```
 
+Default runtime policy in French scripts:
+- `word_max_samples=20000`
+- `part_max_samples=5000` (syllable/phoneme)
+- summary logging (reduced console spam)
+- plotting/similarity disabled by default for faster runs
+
+Optional heavy post-steps:
+
+```powershell
+python run\generate_syllable_embedding_fr.py --plot --similarity --similarity-topn 10
+python run\generate_phoneme_embedding_fr.py --plot --similarity --similarity-topn 10
+```
+
 Expected generated model files:
 - `data\embedding\models\word_embedding_fr.model`
 - `data\embedding\models\syllable_embedding_fr.model`

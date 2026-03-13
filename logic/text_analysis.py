@@ -36,6 +36,9 @@ class TextAnalysis(object):
         self.stemmer = SnowballStemmer(language=lang_stemm[lang])
         self.epi = epitran.Epitran(lang_ipa[lang])
         self.nlp = self.load_sapcy(lang)
+        # Lightweight caches to reduce repeated transliteration/transcription cost.
+        self._syllable_translit_cache = {}
+        self._phoneme_list_cache = {}
 
     def load_sapcy(self, lang):
         result = None
@@ -94,33 +97,77 @@ class TextAnalysis(object):
             print('Error sentences_vector: {0}'.format(e))
         return result
 
-    def part_vector(self, list_text, syllable=True, size_syllable=0):
+    def part_vector(self, list_text, syllable=True, size_syllable=0, verbosity='summary', log_every=500):
         result = []
         try:
+            processed_sentences = 0
+
             for text in list_text:
                 doc = self.analysis_pipe(text.lower())
+                if doc is None:
+                    continue
+
                 for stm in doc.sents:
-                    stm = str(stm).rstrip()
-                    stm = self.clean_text(stm)
-                    if stm != '':
-                        print('Sentence: {0}'.format(stm))
-                        if syllable:
-                            list_syllable = [token['syllables'] for token in self.tagger(stm) if
-                                             token['syllables'] is not None]
-                            list_syllable_phonetic = []
-                            for token_syllables in list_syllable:
-                                n = len(token_syllables) if size_syllable == 0 else size_syllable
-                                for s in token_syllables[:n]:
+                    stm_text = self.clean_text(str(stm).rstrip())
+                    if not stm_text:
+                        continue
+
+                    processed_sentences += 1
+
+                    if syllable:
+                        sentence_doc = self.analysis_pipe(stm_text)
+                        if sentence_doc is None:
+                            continue
+
+                        list_syllable_phonetic = []
+                        for token in sentence_doc:
+                            try:
+                                token_syllables = token._.syllables
+                            except Exception:
+                                token_syllables = None
+
+                            if token_syllables is None:
+                                continue
+
+                            n = len(token_syllables) if size_syllable == 0 else size_syllable
+                            for s in token_syllables[:n]:
+                                if s in self._syllable_translit_cache:
+                                    syllable_phonetic = self._syllable_translit_cache[s]
+                                else:
                                     syllable_phonetic = self.epi.transliterate(s, normpunc=True)
-                                    if syllable_phonetic not in [' ', '', '\ufeff', '1']:
-                                        list_syllable_phonetic.append(syllable_phonetic)
+                                    self._syllable_translit_cache[s] = syllable_phonetic
+
+                                if syllable_phonetic not in [' ', '', '\ufeff', '1']:
+                                    list_syllable_phonetic.append(syllable_phonetic)
+
+                        if list_syllable_phonetic:
                             result.append(list_syllable_phonetic)
-                            print('vector: {0}'.format(list_syllable_phonetic))
+                            if verbosity == 'full':
+                                print('Sentence: {0}'.format(stm_text))
+                                print('vector: {0}'.format(list_syllable_phonetic))
+                    else:
+                        if stm_text in self._phoneme_list_cache:
+                            list_phonemes = self._phoneme_list_cache[stm_text]
                         else:
-                            list_phonemes = self.epi.trans_list(stm, normpunc=True)
+                            list_phonemes = self.epi.trans_list(stm_text, normpunc=True)
                             list_phonemes = [i for i in list_phonemes if i not in [' ', '', '\ufeff', '1']]
+                            self._phoneme_list_cache[stm_text] = list_phonemes
+
+                        if list_phonemes:
                             result.append(list_phonemes)
-                            print('Vector: {0}'.format(list_phonemes))
+                            if verbosity == 'full':
+                                print('Sentence: {0}'.format(stm_text))
+                                print('Vector: {0}'.format(list_phonemes))
+
+                    if verbosity == 'summary' and processed_sentences % log_every == 0:
+                        print('Processed {0} cleaned sentences; vectors generated: {1}'.format(
+                            processed_sentences, len(result)
+                        ))
+
+            if verbosity == 'summary':
+                print('Completed part_vector. Processed {0} cleaned sentences; vectors generated: {1}'.format(
+                    processed_sentences, len(result)
+                ))
         except Exception as e:
             Utils.standard_error(sys.exc_info())
             print('Error phonemes_vector: {0}'.format(e))

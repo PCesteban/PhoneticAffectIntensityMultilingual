@@ -23,3 +23,8 @@ Thumbs.db
 
 # Local caches
 .cache/
+
+# Local notebooks
+notebooks/word_embedding_fr_exploration.ipynb
+notebooks/syllable_embedding_fr_exploration.ipynb
+notebooks/phoneme_embedding_fr_exploration.ipynb

@@ -1,4 +1,5 @@
 import multiprocessing
+import json
 import os
 import sys
 import time
@@ -15,7 +16,7 @@ from tqdm import tqdm
 import operator
 from logic.text_analysis import TextAnalysis
 from logic.utils import Utils
-from root import DIR_IMAGE, DIR_MODELS, DIR_EMBEDDING
+from root import DIR_IMAGE, DIR_MODELS, DIR_EMBEDDING, DIR_OUTPUT
 from sklearn.manifold import TSNE
 import matplotlib.pyplot as plt
 
@@ -28,13 +29,34 @@ if not hasattr(spacy, "Language"):
 
 class Embedding(object):
 
-    def __init__(self, lang='es', max_samples=100000):
+    def __init__(
+        self,
+        lang='es',
+        max_samples=100000,
+        word_max_samples=None,
+        part_max_samples=None,
+        verbosity='full',
+    ):
         self.lang = lang
         self.max_samples = max_samples
+        self.word_max_samples = max_samples if word_max_samples is None else word_max_samples
+        self.part_max_samples = max_samples if part_max_samples is None else part_max_samples
+        self.verbosity = verbosity
         self.cores = multiprocessing.cpu_count()
-        self.part_corpus = self.import_part_corpus(lang=lang, max_samples=max_samples)
         self.text_analysis = TextAnalysis(lang)
-        self.corpus = self.import_words_corpus(max_samples=max_samples)
+        # Lazy-load corpora only when needed by the selected training method.
+        self.part_corpus = None
+        self.corpus = None
+
+    def _ensure_word_corpus_loaded(self):
+        if self.corpus is None:
+            self.corpus = self.import_words_corpus(max_samples=self.word_max_samples)
+
+    def _ensure_part_corpus_loaded(self):
+        if self.part_corpus is None:
+            self.part_corpus = self.import_part_corpus(
+                lang=self.lang, max_samples=self.part_max_samples
+            )
 
     def import_words_corpus(self, max_samples=100000):
         """
@@ -134,6 +156,7 @@ class Embedding(object):
                 size = 150
 
             start_time = time.time()
+            self._ensure_word_corpus_loaded()
             corpus_vec = self.text_analysis.sentences_vector(self.corpus)
 
             model = Word2Vec(corpus_vec, cbow_mean=1, workers=self.cores-1, size=size, min_count=min_count,
@@ -171,7 +194,12 @@ class Embedding(object):
         """
         try:
             start_time = time.time()
-            corpus_vec = self.text_analysis.part_vector(self.part_corpus, syllable=syllable)
+            self._ensure_part_corpus_loaded()
+            corpus_vec = self.text_analysis.part_vector(
+                self.part_corpus,
+                syllable=syllable,
+                verbosity=self.verbosity,
+            )
 
             model = Word2Vec(corpus_vec, cbow_mean=1, workers=self.cores-1, size=size, min_count=min_count,
                              window=window, sample=sample, negative=negative, alpha=alpha, min_alpha=min_alpha, iter=10)
@@ -195,19 +223,49 @@ class Embedding(object):
             Utils.standard_error(sys.exc_info())
             print('Error part_embedding: {0}'.format(e))
 
-    def get_similarity(self, model_name):
+    def get_similarity(self, model_name, topn=10, verbosity='full', save_output=False):
         dict_vocabulary = {}
         try:
             file_model = "{0}{1}_{2}.model".format(DIR_MODELS, model_name, self.lang)
             model = Word2Vec.load(file_model, mmap=None)
             vocabulary = list(model.wv.vocab)
+            records = []
+
             for i in vocabulary:
-                dict_vocabulary[i] = model.most_similar(i)
-                if i != '':
+                similar_items = model.most_similar(i, topn=topn)
+                dict_vocabulary[i] = similar_items
+                records.append({'token': i, 'most_similar': similar_items})
+
+                if verbosity == 'full' and i != '':
                     print('Token: {0}\nMost Similar:'.format(i))
-                    for j in model.most_similar(i):
+                    for j in similar_items:
                         print(j)
-            print(vocabulary)
+
+            if verbosity == 'summary':
+                print('Similarity computed for {0} tokens (topn={1})'.format(len(vocabulary), topn))
+                for token in vocabulary[:10]:
+                    print('{0}: {1}'.format(token, dict_vocabulary[token][:3]))
+
+            if save_output:
+                os.makedirs(DIR_OUTPUT, exist_ok=True)
+                base = '{0}_{1}'.format(model_name, self.lang)
+                json_path = os.path.join(DIR_OUTPUT, 'similarity_{0}.json'.format(base))
+                csv_path = os.path.join(DIR_OUTPUT, 'similarity_{0}.csv'.format(base))
+
+                with open(json_path, 'w', encoding='utf-8') as f:
+                    json.dump(records, f, ensure_ascii=False, indent=2)
+
+                csv_rows = []
+                for row in records:
+                    token = row['token']
+                    for similar_token, score in row['most_similar']:
+                        csv_rows.append({
+                            'token': token,
+                            'similar_token': similar_token,
+                            'score': score,
+                        })
+                pd.DataFrame(csv_rows).to_csv(csv_path, index=False, sep=';', encoding='utf-8')
+                print('Saved similarity outputs: {0}, {1}'.format(json_path, csv_path))
         except Exception as e:
             Utils.standard_error(sys.exc_info())
             print('Error get_similarity: {0}'.format(e))
