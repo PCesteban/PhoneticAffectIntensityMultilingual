@@ -1,6 +1,7 @@
 import os
 import re
 import sys
+import logging
 import unicodedata
 import spacy
 from spacy.lang.es import Spanish
@@ -16,6 +17,10 @@ try:
     from spacy_syllables import SpacySyllables
 except Exception:
     SpacySyllables = None
+try:
+    import pyphen
+except Exception:
+    pyphen = None
 import pandas as pd
 import epitran
 from tqdm import tqdm
@@ -28,13 +33,27 @@ from root import DIR_INPUT, DIR_EMBEDDING
 class TextAnalysis(object):
     name = 'text_analysis'
     lang = 'es'
+    _INVALID_PHONETIC_TOKENS = {' ', '', '\ufeff', '1'}
 
     def __init__(self, lang):
         lang_ipa = {'es': 'spa-Latn', 'en': 'eng-Latn', 'fr': 'fra-Latn'}
         lang_stemm = {'es': 'spanish', 'en': 'english', 'fr': 'french'}
         self.lang = lang
+        # Epitran can emit very frequent warning logs (e.g., missing optional flite lookup in English),
+        # which significantly slows long training runs due to console I/O.
+        logging.getLogger('epitran').setLevel(logging.ERROR)
+        logging.getLogger('epitran.lex_lookup').setLevel(logging.ERROR)
         self.stemmer = SnowballStemmer(language=lang_stemm[lang])
         self.epi = epitran.Epitran(lang_ipa[lang])
+        self.en_pyphen = None
+        if self.lang == 'en':
+            if pyphen is not None:
+                try:
+                    self.en_pyphen = pyphen.Pyphen(lang='en_US')
+                except Exception:
+                    self.en_pyphen = None
+            else:
+                print('Warning: pyphen is not installed; EN syllable quality may degrade.')
         self.nlp = self.load_sapcy(lang)
         # Lightweight caches to reduce repeated transliteration/transcription cost.
         self._syllable_translit_cache = {}
@@ -81,6 +100,108 @@ class TextAnalysis(object):
             print('Error analysis_pipe: {0}'.format(e))
         return doc
 
+    def _is_valid_phonetic_token(self, token):
+        return token is not None and str(token).strip() not in self._INVALID_PHONETIC_TOKENS
+
+    def _to_phonetic_token(self, text, cache_dict):
+        if text is None:
+            return ''
+        text = str(text).strip()
+        if not text:
+            return ''
+
+        if text in cache_dict:
+            return cache_dict[text]
+
+        phonetic = ''
+        try:
+            phonetic = self.epi.transliterate(text, normpunc=True)
+        except Exception:
+            phonetic = ''
+
+        if not self._is_valid_phonetic_token(phonetic):
+            try:
+                list_phon = self.epi.trans_list(text, normpunc=True)
+                list_phon = [i for i in list_phon if self._is_valid_phonetic_token(i)]
+                if list_phon:
+                    phonetic = ''.join(list_phon)
+            except Exception:
+                phonetic = ''
+
+        if not self._is_valid_phonetic_token(phonetic):
+            phonetic = ''
+
+        cache_dict[text] = phonetic
+        return phonetic
+
+    def _clean_syllable_chunk(self, chunk):
+        value = str(chunk).strip().lower()
+        if self.lang == 'en':
+            value = re.sub(r"[^a-z]", "", value)
+        return value
+
+    @staticmethod
+    def _is_en_unsplit_syllables(syllables, token_text):
+        token_text = str(token_text).strip().lower()
+        if not token_text:
+            return True
+        if not syllables:
+            return True
+        if len(syllables) == 1:
+            item = str(syllables[0]).strip().lower()
+            if item == token_text and len(token_text) >= 4 and token_text.isalpha():
+                return True
+        return False
+
+    def _get_en_pyphen_syllables(self, token_text):
+        token_text = str(token_text).strip().lower()
+        if not token_text or self.en_pyphen is None:
+            return []
+        try:
+            inserted = self.en_pyphen.inserted(token_text)
+        except Exception:
+            return []
+        if not inserted:
+            return []
+        chunks = [self._clean_syllable_chunk(i) for i in inserted.split('-')]
+        return [i for i in chunks if i]
+
+    def _get_token_syllables(self, token):
+        token_text = str(token.text).strip().lower()
+        source = 'none'
+        unsplit_rejected = False
+
+        try:
+            raw_syllables = token._.syllables
+        except Exception:
+            raw_syllables = None
+
+        if raw_syllables is None:
+            syllables = []
+        elif isinstance(raw_syllables, str):
+            syllables = [raw_syllables]
+        elif isinstance(raw_syllables, (list, tuple)):
+            syllables = list(raw_syllables)
+        else:
+            syllables = []
+
+        syllables = [self._clean_syllable_chunk(i) for i in syllables if str(i).strip()]
+        syllables = [i for i in syllables if i]
+        if syllables:
+            source = 'spacy'
+
+        if self.lang == 'en' and self._is_en_unsplit_syllables(syllables, token_text):
+            pyphen_syllables = self._get_en_pyphen_syllables(token_text)
+            if pyphen_syllables:
+                syllables = pyphen_syllables
+                source = 'pyphen'
+            else:
+                syllables = []
+                source = 'none'
+                unsplit_rejected = True
+
+        return syllables, source, token_text, unsplit_rejected
+
     def sentences_vector(self, list_text):
         result = []
         try:
@@ -101,6 +222,11 @@ class TextAnalysis(object):
         result = []
         try:
             processed_sentences = 0
+            skipped_sentences = 0
+            en_orthographic_syllable_fallbacks = 0
+            en_spacy_syllable_tokens = 0
+            en_pyphen_syllable_tokens = 0
+            en_unsplit_rejected_tokens = 0
 
             for text in list_text:
                 doc = self.analysis_pipe(text.lower())
@@ -108,66 +234,93 @@ class TextAnalysis(object):
                     continue
 
                 for stm in doc.sents:
-                    stm_text = self.clean_text(str(stm).rstrip())
-                    if not stm_text:
-                        continue
-
-                    processed_sentences += 1
-
-                    if syllable:
-                        sentence_doc = self.analysis_pipe(stm_text)
-                        if sentence_doc is None:
+                    try:
+                        stm_text = self.clean_text(str(stm).rstrip())
+                        if not stm_text:
                             continue
 
-                        list_syllable_phonetic = []
-                        for token in sentence_doc:
-                            try:
-                                token_syllables = token._.syllables
-                            except Exception:
-                                token_syllables = None
+                        processed_sentences += 1
 
-                            if token_syllables is None:
+                        if syllable:
+                            sentence_doc = self.analysis_pipe(stm_text)
+                            if sentence_doc is None:
                                 continue
 
-                            n = len(token_syllables) if size_syllable == 0 else size_syllable
-                            for s in token_syllables[:n]:
-                                if s in self._syllable_translit_cache:
-                                    syllable_phonetic = self._syllable_translit_cache[s]
-                                else:
-                                    syllable_phonetic = self.epi.transliterate(s, normpunc=True)
-                                    self._syllable_translit_cache[s] = syllable_phonetic
+                            list_syllable_phonetic = []
+                            for token in sentence_doc:
+                                token_syllables, syllable_source, token_text, unsplit_rejected = self._get_token_syllables(token)
+                                if self.lang == 'en':
+                                    if syllable_source == 'spacy':
+                                        en_spacy_syllable_tokens += 1
+                                    elif syllable_source == 'pyphen':
+                                        en_pyphen_syllable_tokens += 1
+                                    if unsplit_rejected:
+                                        en_unsplit_rejected_tokens += 1
 
-                                if syllable_phonetic not in [' ', '', '\ufeff', '1']:
-                                    list_syllable_phonetic.append(syllable_phonetic)
+                                if not token_syllables:
+                                    continue
 
-                        if list_syllable_phonetic:
-                            result.append(list_syllable_phonetic)
-                            if verbosity == 'full':
-                                print('Sentence: {0}'.format(stm_text))
-                                print('vector: {0}'.format(list_syllable_phonetic))
-                    else:
-                        if stm_text in self._phoneme_list_cache:
-                            list_phonemes = self._phoneme_list_cache[stm_text]
+                                token_emitted = False
+                                n = len(token_syllables) if size_syllable == 0 else size_syllable
+                                for s in token_syllables[:n]:
+                                    if not s:
+                                        continue
+                                    syllable_phonetic = self._to_phonetic_token(s, self._syllable_translit_cache)
+                                    if self._is_valid_phonetic_token(syllable_phonetic):
+                                        list_syllable_phonetic.append(syllable_phonetic)
+                                        token_emitted = True
+                                    elif self.lang == 'en':
+                                        # Keep EN output in syllable space even when phonetic conversion fails.
+                                        # Fallback to orthographic syllable chunk; never fallback to full token.
+                                        s_norm = str(s).strip().lower()
+                                        if s_norm and s_norm.isalpha() and s_norm != token_text:
+                                            list_syllable_phonetic.append(s_norm)
+                                            token_emitted = True
+                                            en_orthographic_syllable_fallbacks += 1
+
+                            if list_syllable_phonetic:
+                                result.append(list_syllable_phonetic)
+                                if verbosity == 'full':
+                                    print('Sentence: {0}'.format(stm_text))
+                                    print('vector: {0}'.format(list_syllable_phonetic))
                         else:
-                            list_phonemes = self.epi.trans_list(stm_text, normpunc=True)
-                            list_phonemes = [i for i in list_phonemes if i not in [' ', '', '\ufeff', '1']]
-                            self._phoneme_list_cache[stm_text] = list_phonemes
+                            if stm_text in self._phoneme_list_cache:
+                                list_phonemes = self._phoneme_list_cache[stm_text]
+                            else:
+                                try:
+                                    list_phonemes = self.epi.trans_list(stm_text, normpunc=True)
+                                except Exception:
+                                    list_phonemes = []
+                                list_phonemes = [i for i in list_phonemes if self._is_valid_phonetic_token(i)]
+                                self._phoneme_list_cache[stm_text] = list_phonemes
 
-                        if list_phonemes:
-                            result.append(list_phonemes)
-                            if verbosity == 'full':
-                                print('Sentence: {0}'.format(stm_text))
-                                print('Vector: {0}'.format(list_phonemes))
+                            if list_phonemes:
+                                result.append(list_phonemes)
+                                if verbosity == 'full':
+                                    print('Sentence: {0}'.format(stm_text))
+                                    print('Vector: {0}'.format(list_phonemes))
 
-                    if verbosity == 'summary' and processed_sentences % log_every == 0:
-                        print('Processed {0} cleaned sentences; vectors generated: {1}'.format(
-                            processed_sentences, len(result)
-                        ))
+                        if verbosity == 'summary' and processed_sentences % log_every == 0:
+                            print('Processed {0} cleaned sentences; vectors generated: {1}'.format(
+                                processed_sentences, len(result)
+                            ))
+                    except Exception:
+                        skipped_sentences += 1
+                        continue
 
             if verbosity == 'summary':
                 print('Completed part_vector. Processed {0} cleaned sentences; vectors generated: {1}'.format(
                     processed_sentences, len(result)
                 ))
+                if skipped_sentences > 0:
+                    print('Skipped {0} sentences due to processing errors'.format(skipped_sentences))
+                if syllable and self.lang == 'en':
+                    print('EN syllable sources -> spaCy tokens: {0}, pyphen tokens: {1}, unsplit rejected: {2}'.format(
+                        en_spacy_syllable_tokens, en_pyphen_syllable_tokens, en_unsplit_rejected_tokens
+                    ))
+                    print('EN fallback usage -> orthographic syllable chunks: {0}'.format(
+                        en_orthographic_syllable_fallbacks
+                    ))
         except Exception as e:
             Utils.standard_error(sys.exc_info())
             print('Error phonemes_vector: {0}'.format(e))

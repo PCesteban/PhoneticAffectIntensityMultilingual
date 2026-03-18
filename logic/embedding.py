@@ -1,6 +1,7 @@
 import multiprocessing
 import json
 import os
+import re
 import sys
 import time
 import traceback
@@ -36,12 +37,14 @@ class Embedding(object):
         word_max_samples=None,
         part_max_samples=None,
         verbosity='full',
+        corpus_source='legacy',
     ):
         self.lang = lang
         self.max_samples = max_samples
         self.word_max_samples = max_samples if word_max_samples is None else word_max_samples
         self.part_max_samples = max_samples if part_max_samples is None else part_max_samples
         self.verbosity = verbosity
+        self.corpus_source = corpus_source
         self.cores = multiprocessing.cpu_count()
         self.text_analysis = TextAnalysis(lang)
         # Lazy-load corpora only when needed by the selected training method.
@@ -50,28 +53,130 @@ class Embedding(object):
 
     def _ensure_word_corpus_loaded(self):
         if self.corpus is None:
-            self.corpus = self.import_words_corpus(max_samples=self.word_max_samples)
+            self.corpus = self.import_words_corpus(
+                max_samples=self.word_max_samples,
+                corpus_source=self.corpus_source,
+            )
 
     def _ensure_part_corpus_loaded(self):
         if self.part_corpus is None:
             self.part_corpus = self.import_part_corpus(
-                lang=self.lang, max_samples=self.part_max_samples
+                lang=self.lang,
+                max_samples=self.part_max_samples,
+                corpus_source=self.corpus_source,
             )
 
-    def import_words_corpus(self, max_samples=100000):
+    @staticmethod
+    def _wikipedia_config_name(lang):
+        return '20231101.{0}'.format(lang)
+
+    @staticmethod
+    def _wikipedia_cache_file(lang, max_samples):
+        cache_dir = os.path.join(DIR_EMBEDDING, 'cache')
+        os.makedirs(cache_dir, exist_ok=True)
+        file_name = 'wikipedia_{0}_{1}_{2}.jsonl'.format('20231101', lang, max_samples)
+        return os.path.join(cache_dir, file_name)
+
+    @staticmethod
+    def _load_cached_wikipedia_articles(cache_file):
+        result = []
+        with open(cache_file, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                row = json.loads(line)
+                result.append(row.get('text', ''))
+        return result
+
+    @staticmethod
+    def _save_cached_wikipedia_articles(cache_file, articles):
+        with open(cache_file, 'w', encoding='utf-8') as f:
+            for article in articles:
+                f.write(json.dumps({'text': article}, ensure_ascii=False) + '\n')
+
+    def _stream_wikipedia_articles(self, lang, max_samples):
+        if max_samples is None:
+            raise ValueError('max_samples must be provided for Wikipedia streaming mode.')
+
+        config_name = self._wikipedia_config_name(lang)
+        dataset = load_dataset(
+            'wikimedia/wikipedia',
+            config_name,
+            split='train',
+            streaming=True,
+        )
+        result = []
+        progress = tqdm(total=max_samples, desc='Streaming Wikipedia subset ({0})'.format(lang))
+        for row in dataset:
+            result.append(row.get('text', ''))
+            progress.update(1)
+            if len(result) >= max_samples:
+                break
+        progress.close()
+        return result
+
+    def _get_wikipedia_articles(self, lang, max_samples=100000):
+        cache_file = self._wikipedia_cache_file(lang=lang, max_samples=max_samples)
+        if os.path.exists(cache_file):
+            print('Using cached Wikipedia subset: {0}'.format(cache_file))
+            articles = self._load_cached_wikipedia_articles(cache_file)
+            print('Loaded {0} cached Wikipedia articles'.format(len(articles)))
+            return articles
+
+        print('Streaming.... Wikipedia {0} corpus from HuggingFace'.format(lang))
+        print('Wikipedia sample cap: {0}'.format(max_samples))
+        articles = self._stream_wikipedia_articles(lang=lang, max_samples=max_samples)
+        self._save_cached_wikipedia_articles(cache_file=cache_file, articles=articles)
+        print('Saved cached Wikipedia subset: {0}'.format(cache_file))
+        print('Loaded {0} streamed Wikipedia articles'.format(len(articles)))
+        return articles
+
+    def _import_words_from_wikipedia(self, lang, max_samples=100000):
+        result = []
+        articles = self._get_wikipedia_articles(lang=lang, max_samples=max_samples)
+        for article in tqdm(articles, desc='Preparing word corpus ({0})'.format(lang)):
+            clean = re.sub(r'\s+', ' ', article).strip()
+            if len(clean) > 50:
+                result.append(clean)
+        print('Loaded {0} texts from Wikipedia'.format(len(result)))
+        return result
+
+    def _import_part_from_wikipedia(self, lang, max_samples=100000):
+        result = []
+        articles = self._get_wikipedia_articles(lang=lang, max_samples=max_samples)
+        for article in tqdm(articles, desc='Preparing part corpus ({0})'.format(lang)):
+            clean = re.sub(r'\s+', ' ', article).strip().lower()
+            sentences = re.split(r'[.!?\n]+', clean)
+            for sent in sentences:
+                sent = sent.strip()
+                if len(sent.split()) > 3:
+                    result.append(sent)
+        print('Loaded {0} sentences from Wikipedia'.format(len(result)))
+        return result
+
+    def import_words_corpus(self, max_samples=100000, corpus_source=None):
         """
         :Version: 1.1
         :Author: Edwin Puertas
         This function imports corpus in spanish, english, or french.
-        Uses SemEval-2018 for es/en and Wikipedia via HuggingFace for other languages.
+        Source is selected with corpus_source:
+          - legacy: SemEval-2018 for es/en, Wikipedia fallback for other languages
+          - wikipedia: Wikipedia via HuggingFace for all languages
         :param max_samples: max Wikipedia articles to load (for languages without SemEval data)
         :type max_samples: int
+        :param corpus_source: data source strategy ('legacy' or 'wikipedia')
+        :type corpus_source: Text
         :rtype: list
         :return: list of text strings
         """
         result = []
         try:
-            if self.lang in ('es', 'en'):
+            source = self.corpus_source if corpus_source is None else corpus_source
+            if source not in ('legacy', 'wikipedia'):
+                raise ValueError("Invalid corpus_source '{0}'. Use 'legacy' or 'wikipedia'.".format(source))
+
+            if source == 'legacy' and self.lang in ('es', 'en'):
                 file_es = 'SemEval-2018_AIT_DISC_ES.csv'
                 file_en = 'SemEval-2018_AIT_DISC_EN.csv'
                 file = file_es if self.lang == 'es' else file_en
@@ -79,47 +184,44 @@ class Embedding(object):
                 corpus = self.text_analysis.import_corpus(file=file)
                 result = [i[1] for i in corpus]
             else:
-                print('Loading.... Wikipedia {0} corpus from HuggingFace'.format(self.lang))
-                print('Wikipedia sample cap: {0}'.format(max_samples))
-                config_name = '20231101.{0}'.format(self.lang)
-                dataset = load_dataset('wikimedia/wikipedia', config_name, split='train')
-                rows = dataset if max_samples is None else dataset.select(range(min(max_samples, len(dataset))))
-                for row in tqdm(rows):
-                    import re
-                    article = row.get('text', '')
-                    clean = re.sub(r'\s+', ' ', article).strip()
-                    if len(clean) > 50:
-                        result.append(clean)
-                print('Loaded {0} texts from Wikipedia'.format(len(result)))
+                result = self._import_words_from_wikipedia(lang=self.lang, max_samples=max_samples)
         except Exception as e:
             Utils.standard_error(sys.exc_info())
             print('Error import_words_corpus: {0}'.format(e))
             traceback.print_exc()
         return result
 
-    def import_part_corpus(self, lang='es', max_samples=100000):
+    def import_part_corpus(self, lang='es', max_samples=100000, corpus_source=None):
         """
         :Version: 1.1
         :Author: Edwin Puertas
         This function imports corpus in spanish, english, or french.
-        Uses NLTK corpora for es/en and Wikipedia via HuggingFace for fr.
+        Source is selected with corpus_source:
+          - legacy: NLTK CESS(es)/BROWN(en), Wikipedia fallback for fr
+          - wikipedia: Wikipedia via HuggingFace for all languages
         :param lang: language code ('es', 'en', 'fr')
         :type lang: Text
         :param max_samples: max Wikipedia articles to load (for fr)
         :type max_samples: int
+        :param corpus_source: data source strategy ('legacy' or 'wikipedia')
+        :type corpus_source: Text
         :rtype: list
         :return: list of text strings
         """
         result = []
         try:
-            if lang == 'es':
+            source = self.corpus_source if corpus_source is None else corpus_source
+            if source not in ('legacy', 'wikipedia'):
+                raise ValueError("Invalid corpus_source '{0}'. Use 'legacy' or 'wikipedia'.".format(source))
+
+            if source == 'legacy' and lang == 'es':
                 print('Loading.... CESS corpus')
                 sentences_list = cess_esp.sents()
                 for sent in tqdm(list(sentences_list)):
                     list_text = [str(token).lower() for token in list(sent)]
                     text = ' '.join(list_text)
                     result.append(text)
-            elif lang == 'en':
+            elif source == 'legacy' and lang == 'en':
                 print('Loading.... BROWN corpus')
                 sentences_list = brown.sents(categories=['editorial'])
                 for sent in tqdm(list(sentences_list)):
@@ -127,21 +229,7 @@ class Embedding(object):
                     text = ' '.join(list_text)
                     result.append(text)
             else:
-                print('Loading.... Wikipedia {0} corpus from HuggingFace'.format(lang))
-                print('Wikipedia sample cap: {0}'.format(max_samples))
-                config_name = '20231101.{0}'.format(lang)
-                dataset = load_dataset('wikimedia/wikipedia', config_name, split='train')
-                rows = dataset if max_samples is None else dataset.select(range(min(max_samples, len(dataset))))
-                for row in tqdm(rows):
-                    import re
-                    article = row.get('text', '')
-                    clean = re.sub(r'\s+', ' ', article).strip().lower()
-                    sentences = re.split(r'[.!?\n]+', clean)
-                    for sent in sentences:
-                        sent = sent.strip()
-                        if len(sent.split()) > 3:
-                            result.append(sent)
-                print('Loaded {0} sentences from Wikipedia'.format(len(result)))
+                result = self._import_part_from_wikipedia(lang=lang, max_samples=max_samples)
         except Exception as e:
             Utils.standard_error(sys.exc_info())
             print('Error import_part_corpus: {0}'.format(e))
