@@ -228,6 +228,50 @@ class TextAnalysis(object):
             en_pyphen_syllable_tokens = 0
             en_unsplit_rejected_tokens = 0
 
+            # EN-only fast path for phoneme embeddings:
+            # list_text is already sentence-level for legacy and wikipedia part corpora.
+            # Skip spaCy parsing and convert each cleaned sentence directly to phoneme tokens.
+            if (self.lang == 'en') and (syllable is False):
+                for text in list_text:
+                    try:
+                        stm_text = self.clean_text(str(text).rstrip())
+                        if not stm_text:
+                            continue
+
+                        processed_sentences += 1
+
+                        if stm_text in self._phoneme_list_cache:
+                            list_phonemes = self._phoneme_list_cache[stm_text]
+                        else:
+                            try:
+                                list_phonemes = self.epi.trans_list(stm_text, normpunc=True)
+                            except Exception:
+                                list_phonemes = []
+                            list_phonemes = [i for i in list_phonemes if self._is_valid_phonetic_token(i)]
+                            self._phoneme_list_cache[stm_text] = list_phonemes
+
+                        if list_phonemes:
+                            result.append(list_phonemes)
+                            if verbosity == 'full':
+                                print('Sentence: {0}'.format(stm_text))
+                                print('Vector: {0}'.format(list_phonemes))
+
+                        if verbosity == 'summary' and processed_sentences % log_every == 0:
+                            print('Processed {0} cleaned sentences; vectors generated: {1}'.format(
+                                processed_sentences, len(result)
+                            ))
+                    except Exception:
+                        skipped_sentences += 1
+                        continue
+
+                if verbosity == 'summary':
+                    print('Completed part_vector. Processed {0} cleaned sentences; vectors generated: {1}'.format(
+                        processed_sentences, len(result)
+                    ))
+                    if skipped_sentences > 0:
+                        print('Skipped {0} sentences due to processing errors'.format(skipped_sentences))
+                return result
+
             for text in list_text:
                 doc = self.analysis_pipe(text.lower())
                 if doc is None:
